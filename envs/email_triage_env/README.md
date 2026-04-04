@@ -1,6 +1,6 @@
 ---
 title: Email Triage Environment
-emoji: "mailbox"
+emoji: "📬"
 colorFrom: blue
 colorTo: green
 sdk: docker
