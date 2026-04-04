@@ -1,265 +1,127 @@
-"""
-Inference Script Example
-===================================
-MANDATORY
-- Before submitting, ensure the following variables are defined in your environment configuration:
-  API_BASE_URL The API endpoint for the LLM.
-  MODEL_NAME The model identifier to use for inference.
-  HF_TOKEN Your Hugging Face / API key.
+"""Submission inference script for email_triage_env.
 
-- The inference script must be named `inference.py` and placed in the root directory of the project
-- Participants must use OpenAI Client for all LLM calls using above variables
+Required environment variables:
+- API_BASE_URL: LLM endpoint for OpenAI-compatible chat completions.
+- MODEL_NAME: Model identifier used for inference.
+- HF_TOKEN: API key/token used by the OpenAI client.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
 import os
-import re
-import base64
-import textwrap
-from io import BytesIO
-from typing import List, Optional, Dict
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
 
 from openai import OpenAI
-import numpy as np
-from PIL import Image
 
-from browsergym_env import BrowserGymAction, BrowserGymEnv
+try:
+    from email_triage_env import EmailTriageAction, EmailTriageEnv
+except ImportError:
+    # Allows running `python inference.py` from this folder.
+    package_parent = Path(__file__).resolve().parent.parent
+    if str(package_parent) not in sys.path:
+        sys.path.insert(0, str(package_parent))
+    from email_triage_env import EmailTriageAction, EmailTriageEnv
 
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
-
-MAX_STEPS = 8
-MAX_DOM_CHARS = 3500
-TEMPERATURE = 0.2
-MAX_TOKENS = 200
-FALLBACK_ACTION = "noop()"
-
-DEBUG = True
-
-ACTION_PREFIX_RE = re.compile(
-    r"^(action|next action)\s*[:\-]\s*",
-    re.IGNORECASE,
-)
-
-ACTION_PATTERN = re.compile(
-    r"[A-Za-z_]+\s*\(.*\)",
-    re.DOTALL
-)
-
-SYSTEM_PROMPT = textwrap.dedent("""
-    You control a web browser through BrowserGym.
-    Reply with exactly one action string.
-    The action must be a valid BrowserGym command such as:
-    - noop()
-    - click('<BID>')
-    - type('selector', 'text to enter')
-    - fill('selector', 'text to enter')
-    - send_keys('Enter')
-    - scroll('down')
-    Use single quotes around string arguments.
-    When clicking, use the BrowserGym element IDs (BIDs) listed in the user message.
-    If you are unsure, respond with noop().
-    Do not include explanations or additional text.
-""").strip()
+TASK_IDS: List[str] = [
+    "easy_security_triage",
+    "medium_billing_outage",
+    "hard_vip_legal_security",
+]
 
 
-def build_history_lines(history: List[str]) -> str:
-    if not history:
-        return "None"
-    return "\n".join(history[-4:])
-
-def extract_screenshot_uri(observation) -> Optional[str]:
-    if observation.screenshot is None:
-        return None
-    screen_array = np.array(observation.screenshot, dtype=np.uint8)
-    image = Image.fromarray(screen_array)
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-    data_uri = base64.b64encode(buffer.read()).decode("utf-8")
-    return f"data:image/png;base64,{data_uri}"
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise SystemExit(f"{name} is required.")
+    return value
 
 
-def extract_clickable_elements(observation) -> List[Dict[str, str]]:
-    """Collect BrowserGym element IDs that can be clicked."""
+def build_prompt(observation: Dict[str, Any]) -> str:
+    return (
+        "You are an email operations triage agent. Return ONLY valid JSON with keys: "
+        "action_type,email_id,category,priority,assignee,reply_template,follow_up_days,resolution_note. "
+        "Use null for unused keys.\n\n"
+        f"Task: {observation['objective']}\n"
+        f"Difficulty: {observation['difficulty']}\n"
+        f"Step: {observation['current_step']}/{observation['max_steps']}\n"
+        f"Current score: {observation['score']}\n"
+        f"Checklist:\n{json.dumps(observation['checklist'], indent=2)}\n"
+        f"Inbox:\n{json.dumps(observation['inbox'], indent=2)}\n"
+        f"Last feedback: {observation.get('last_feedback', '')}\n"
+    )
 
-    metadata = getattr(observation, "metadata", {}) or {}
-    obs_dict = metadata.get("browsergym_obs", {}) or {}
-    extra_props = obs_dict.get("extra_element_properties", {}) or {}
 
-    clickables: List[Dict[str, str]] = []
-    for bid, props in extra_props.items():
-        if not props.get("clickable"):
-            continue
-
-        bbox = props.get("bbox") or []
-        bbox_str = ", ".join(bbox) if bbox else "?"
-        clickables.append(
+def llm_action(client: OpenAI, model: str, observation: Dict[str, Any]) -> EmailTriageAction:
+    completion = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
             {
-                "bid": str(bid),
-                "bbox": bbox_str,
-            }
-        )
+                "role": "system",
+                "content": (
+                    "Choose one triage action that maximizes checklist completion and "
+                    "avoids invalid actions."
+                ),
+            },
+            {"role": "user", "content": build_prompt(observation)},
+        ],
+    )
 
-    # Keep a stable ordering for readability
-    clickables.sort(key=lambda item: item["bid"])
-    return clickables
+    text = completion.choices[0].message.content or "{}"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = {"action_type": "noop"}
 
-
-def build_user_prompt(step: int, observation, history: List[str]) -> str:
-    goal = observation.goal or "(not provided)"
-    url = observation.url or "(unknown)"
-    error_note = "Yes" if observation.last_action_error else "No"
-
-    clickables = extract_clickable_elements(observation)
-    if clickables:
-        actions_hint = "\n".join(
-            f"    - {item['bid']} (bbox: {item['bbox']})" for item in clickables
-        )
-    else:
-        actions_hint = "    (none detected)"
-
-    prompt = textwrap.dedent(
-        f"""
-        Step: {step}
-        Goal: {goal}
-        Current URL: {url}
-        Previous steps:
-        {build_history_lines(history)}
-        Last action error: {error_note}
-        Available clickable element IDs: {actions_hint}
-        Reply with exactly one BrowserGym action string.
-        """
-    ).strip()
-    return prompt
+    try:
+        return EmailTriageAction(**payload)
+    except Exception:
+        return EmailTriageAction(action_type="noop")
 
 
-def parse_model_action(response_text: str) -> str:
-    if not response_text:
-        return FALLBACK_ACTION
-
-    # Prefer the first line that looks like an action string
-    lines = response_text.splitlines()
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        line = ACTION_PREFIX_RE.sub("", line)
-        match = ACTION_PATTERN.search(line)
-        if match:
-            action = match.group(0).strip()
-            # Collapse internal whitespace
-            action = re.sub(r"\s+", " ", action)
-            # If the model tried to click by natural-language description while we
-            # only exposed numeric BrowserGym IDs, fallback to the single detected ID.
-            return action
-
-    # Fall back to searching the whole response
-    match = ACTION_PATTERN.search(response_text)
-    if match:
-        action = match.group(0).strip()
-        action = re.sub(r"\s+", " ", action)
-        return action
-
-    return FALLBACK_ACTION
+def run_task(
+    env: EmailTriageEnv,
+    client: OpenAI,
+    model: str,
+    task_id: str,
+    seed: int,
+) -> float:
+    result = env.reset(task_id=task_id, seed=seed)
+    while not result.done:
+        action = llm_action(client, model, result.observation.model_dump())
+        result = env.step(action)
+    return float(result.observation.score)
 
 
 def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    parser = argparse.ArgumentParser(description="Submission inference for email_triage_env")
+    parser.add_argument("--env-url", default=os.getenv("ENV_BASE_URL", "http://localhost:8000"))
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args()
 
-    env = BrowserGymEnv.from_docker_image(
-        image="browsergym-env:latest",
-        env_vars={
-            "BROWSERGYM_BENCHMARK": "miniwob",
-            "BROWSERGYM_TASK_NAME": "click-test",
-        },
-    )
+    api_base_url = _required_env("API_BASE_URL")
+    model_name = _required_env("MODEL_NAME")
+    hf_token = _required_env("HF_TOKEN")
 
-    history: List[str] = []
+    client = OpenAI(base_url=api_base_url, api_key=hf_token)
 
-    try:
-        result = env.reset()
-        observation = result.observation
-        print(f"Episode goal: {observation.goal}")
+    scores: Dict[str, float] = {}
+    with EmailTriageEnv(base_url=args.env_url).sync() as env:
+        for task_id in TASK_IDS:
+            scores[task_id] = run_task(env, client, model_name, task_id, args.seed)
 
-        for step in range(1, MAX_STEPS + 1):
-            if result.done:
-                print("Environment signalled done. Stopping early.")
-                break
-
-            user_prompt = build_user_prompt(step, observation, history)
-            user_content = [{"type": "text", "text": user_prompt}]
-            screenshot_uri = extract_screenshot_uri(observation)
-            if screenshot_uri:
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": screenshot_uri},
-                    }
-                )
-
-            messages = [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-                },
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
-            ]
-
-
-            try:
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                    stream=False,
-                )
-                response_text = completion.choices[0].message.content or ""
-            # pylint: disable=broad-except
-            except Exception as exc:  # noqa: BLE001
-                failure_msg = f"Model request failed ({exc}). Using fallback action."
-                print(failure_msg)
-                response_text = FALLBACK_ACTION
-
-
-            action_str = parse_model_action(response_text)
-            print(f"Step {step}: model suggested -> {action_str}")
-
-
-            result = env.step(BrowserGymAction(action_str=action_str))
-            observation = result.observation
-
-
-            reward = result.reward or 0.0
-            error_flag = " ERROR" if observation.last_action_error else ""
-            history_line = (
-                f"Step {step}: {action_str} -> reward {reward:+.2f}{error_flag}"
-            )
-            history.append(history_line)
-            print(
-                "  Reward: "
-                f"{reward:+.2f} | Done: {result.done} | Last action error: "
-                f"{observation.last_action_error}"
-            )
-
-
-            if result.done:
-                print("Episode complete.")
-                break
-
-
-        else:
-            print(f"Reached max steps ({MAX_STEPS}).")
-
-
-    finally:
-        env.close()
-
-
+    average = sum(scores.values()) / len(scores)
+    result_payload = {
+        "model": model_name,
+        "scores": scores,
+        "average": average,
+    }
+    print(json.dumps(result_payload, indent=2))
 
 
 if __name__ == "__main__":
