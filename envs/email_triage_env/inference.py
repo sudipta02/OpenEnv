@@ -104,8 +104,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
-    api_base_url = _required_env("API_BASE_URL")
-    model_name = _required_env("MODEL_NAME")
+    api_base_url = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+    model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
     hf_token = _required_env("HF_TOKEN")
 
     client = OpenAI(base_url=api_base_url, api_key=hf_token)

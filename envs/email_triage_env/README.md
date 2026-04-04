@@ -115,13 +115,13 @@ docker run --rm -p 8000:8000 email-triage-env:latest
 
 ```bash
 cd envs/email_triage_env
-openenv push --repo-id <your-username>/email-triage-env
+openenv push --repo-id sudipta02/email-triage-env
 ```
 
 After deployment:
-- Web UI: `https://<your-username>-email-triage-env.hf.space/web`
-- Docs: `https://<your-username>-email-triage-env.hf.space/docs`
-- Health: `https://<your-username>-email-triage-env.hf.space/health`
+- Web UI: `https://sudipta02-email-triage-env.hf.space/web`
+- Docs: `https://sudipta02-email-triage-env.hf.space/docs`
+- Health: `https://sudipta02-email-triage-env.hf.space/health`
 
 ## Baseline Inference (OpenAI)
 
